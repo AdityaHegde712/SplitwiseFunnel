@@ -1,0 +1,7 @@
+# Owner-controlled OAuth material and local receipt data
+credentials.json
+token.json
+data/
+
+# Local Python environment
+.venv/
