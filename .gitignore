@@ -5,3 +5,7 @@ data/
 
 # Local Python environment
 .venv/
+
+# Python execution cache
+__pycache__/
+*.pyc
