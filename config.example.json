@@ -1,0 +1,29 @@
+{
+  "participant_ids": [
+    "himanshu",
+    "krishna",
+    "nitish"
+  ],
+  "payment_mappings": [
+    {
+      "last_four": "0000",
+      "payer_id": "krishna"
+    }
+  ],
+  "absences": [],
+  "rules": [
+    {
+      "match_description": "apples",
+      "include_only": [
+        "nitish"
+      ]
+    },
+    {
+      "match_description": "almonds",
+      "include_only": [
+        "krishna",
+        "nitish"
+      ]
+    }
+  ]
+}
