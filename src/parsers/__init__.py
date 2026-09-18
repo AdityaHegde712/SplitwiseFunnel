@@ -1,0 +1,2 @@
+"""Receipt email parsing adapters."""
+
