@@ -4,30 +4,53 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import date
+import logging
 import re
 from typing import Any
+
+from src.observability.logging import log_event
+
+
+LOGGER = logging.getLogger("splitwise_funnel.domain.allocate")
 
 
 class AllocationError(ValueError):
     """Raised when a receipt cannot be allocated safely."""
 
 
+def get_present_participants(
+    participant_ids: Sequence[str],
+    purchase_date: date | str,
+    absences: Sequence[Mapping[str, Any]] | None = None,
+) -> list[str]:
+    """Return participants who are not marked absent on the given purchase date."""
+    parsed_date: date = (
+        purchase_date if isinstance(purchase_date, date) else _parse_date(purchase_date)
+    )
+    absence_list: Sequence[Mapping[str, Any]] = absences or []
+    return [
+        participant_id
+        for participant_id in participant_ids
+        if not _is_absent(participant_id, parsed_date, absence_list)
+    ]
+
+
 def allocate_receipt(
     receipt: Mapping[str, Any], config: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Allocate receipt item amounts and any receipt-level residual exactly."""
+    log_event(LOGGER, "allocation_started")
     purchase_date: date = _parse_date(receipt["purchase_date"])
     participant_ids: list[str] = list(config["participant_ids"])
     if not participant_ids:
         raise AllocationError("At least one participant is required.")
 
-    present_participants: list[str] = [
-        participant_id
-        for participant_id in participant_ids
-        if not _is_absent(participant_id, purchase_date, config.get("absences", []))
-    ]
+    present_participants: list[str] = get_present_participants(
+        participant_ids, purchase_date, config.get("absences", [])
+    )
     if not present_participants:
         raise AllocationError("No present participants can receive this receipt.")
+
 
     items: Sequence[Mapping[str, Any]] = receipt["items"]
     allocated_items: list[dict[str, Any]] = []
@@ -62,11 +85,20 @@ def allocate_receipt(
         sum(item["shares_cents"].values()) for item in allocated_items
     ) + sum(residual_shares_cents.values())
 
-    return {
+    allocation: dict[str, Any] = {
         "items": allocated_items,
         "residual_shares_cents": residual_shares_cents,
         "total_allocated_cents": total_allocated_cents,
     }
+    log_event(
+        LOGGER,
+        "allocation_completed",
+        item_count=len(allocated_items),
+        present_participant_count=len(present_participants),
+        total_cents=total_allocated_cents,
+        residual_cents=residual_cents,
+    )
+    return allocation
 
 
 def _eligible_participants(
@@ -129,6 +161,10 @@ def _split_cents(amount_cents: int, participant_ids: Sequence[str]) -> dict[str,
         * (base_share_cents + (1 if index < remainder_cents else 0))
         for index, participant_id in enumerate(participant_ids)
     }
+
+
+split_cents = _split_cents
+
 
 
 def _normalize_description(description: object) -> str:

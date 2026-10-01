@@ -6,9 +6,21 @@ import base64
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from email.utils import parseaddr
+import logging
+import time
 from typing import Any
 
-from src.gmail.receipt_filters import build_receipt_query, matches_receipt_signature
+from googleapiclient.errors import HttpError
+
+from src.gmail.receipt_filters import build_vendor_subject_queries, matches_receipt_signature
+from src.observability.logging import log_event
+
+
+LOGGER = logging.getLogger("splitwise_funnel.gmail.client")
+
+
+class GmailRateLimitError(RuntimeError):
+    """Raised when Gmail rejects a bounded local ingestion for quota reasons."""
 
 
 @dataclass(frozen=True)
@@ -28,56 +40,100 @@ def fetch_receipt_emails(
     ends_on: str,
     signatures: Mapping[str, Mapping[str, str]],
 ) -> list[ReceiptEmail]:
-    """Fetch receipt emails that exactly match the selected sender signatures."""
-    query: str = build_receipt_query(vendor_ids, starts_on, ends_on, signatures)
-    selected_signatures: tuple[Mapping[str, str], ...] = tuple(
-        signatures[vendor_id] for vendor_id in vendor_ids
-    )
+    """Fetch receipt emails with one narrow Gmail query per selected vendor."""
+    log_event(LOGGER, "gmail_receipt_fetch_started", vendor_count=len(vendor_ids))
     messages_resource: Any = service.users().messages()
     receipt_emails: list[ReceiptEmail] = []
-    page_token: str | None = None
+    page_count: int = 0
+    seen_message_ids: set[str] = set()
 
-    while True:
-        response: Mapping[str, Any] = messages_resource.list(
-            userId="me", q=query, pageToken=page_token
-        ).execute()
-        message_refs: object = response.get("messages", [])
-        if not isinstance(message_refs, list):
-            raise ValueError("Gmail message listing returned an invalid messages collection.")
-
-        for message_ref in message_refs:
-            message_id: str = _message_id(message_ref)
-            message: Mapping[str, Any] = messages_resource.get(
-                userId="me", id=message_id, format="full"
-            ).execute()
-            sender, subject = _message_headers(message)
-            matching_signature: Mapping[str, str] | None = next(
-                (
-                    signature
-                    for signature in selected_signatures
-                    if matches_receipt_signature(sender, subject, signature)
-                ),
-                None,
-            )
-            if matching_signature is None:
-                continue
-
-            body: str = _extract_supported_body(message)
-            receipt_emails.append(
-                ReceiptEmail(
-                    message_id=message_id,
-                    sender=sender,
-                    subject=subject,
-                    html=body,
+    for vendor_id in vendor_ids:
+        signature = signatures[vendor_id]
+        queries = build_vendor_subject_queries(vendor_id, starts_on, ends_on, signatures)
+        for query in queries:
+            page_token: str | None = None
+            while True:
+                response = _execute_gmail_request(
+                    messages_resource.list(userId="me", q=query, pageToken=page_token)
                 )
-            )
+                page_count += 1
+                message_refs: object = response.get("messages", [])
+                if not isinstance(message_refs, list):
+                    raise ValueError("Gmail message listing returned an invalid messages collection.")
 
-        next_page_token: object = response.get("nextPageToken")
-        if next_page_token is None:
-            return receipt_emails
-        if not isinstance(next_page_token, str) or not next_page_token:
-            raise ValueError("Gmail message listing returned an invalid next page token.")
-        page_token = next_page_token
+                for message_ref in message_refs:
+                    message_id = _message_id(message_ref)
+                    if message_id in seen_message_ids:
+                        continue
+                    time.sleep(0.05)
+                    message = _execute_gmail_request(
+                        messages_resource.get(userId="me", id=message_id, format="full")
+                    )
+                    sender, subject = _message_headers(message)
+                    if not matches_receipt_signature(sender, subject, signature):
+                        log_event(LOGGER, "gmail_receipt_skipped", status="signature_mismatch")
+                        continue
+
+                    seen_message_ids.add(message_id)
+                    body = _extract_supported_body(message)
+                    receipt_emails.append(
+                        ReceiptEmail(
+                            message_id=message_id,
+                            sender=sender,
+                            subject=subject,
+                            html=body,
+                        )
+                    )
+
+                next_page_token: object = response.get("nextPageToken")
+                if next_page_token is None:
+                    break
+                if not isinstance(next_page_token, str) or not next_page_token:
+                    raise ValueError("Gmail message listing returned an invalid next page token.")
+                page_token = next_page_token
+
+    log_event(
+        LOGGER,
+        "gmail_receipt_fetch_completed",
+        status="completed",
+        page_count=page_count,
+        receipt_count=len(receipt_emails),
+    )
+    return receipt_emails
+
+
+def _execute_gmail_request(
+    request: Any,
+    *,
+    max_retries: int = 3,
+    retry_delays: Sequence[float] = (2.0, 5.0),
+) -> Mapping[str, Any]:
+    """Translate a Gmail quota response without recording provider payloads in logs."""
+    for attempt in range(max_retries):
+        try:
+            response: object = request.execute()
+            if not isinstance(response, Mapping):
+                raise ValueError("Gmail request returned an invalid response object.")
+            return response
+        except HttpError as error:
+            if not _is_gmail_rate_limit(error):
+                raise
+            if attempt < max_retries - 1:
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else retry_delays[-1]
+                time.sleep(delay)
+                continue
+            log_event(LOGGER, "gmail_receipt_fetch_rate_limited", status="rate_limited")
+            raise GmailRateLimitError(
+                "Gmail temporarily rate limited receipt ingestion. Wait before retrying; "
+                "no local cache was created for this selection."
+            ) from error
+    raise RuntimeError("Unreachable")
+
+
+def _is_gmail_rate_limit(error: Exception) -> bool:
+    response = getattr(error, "resp", None)
+    status = getattr(response, "status", None)
+    return status == 429 or "rateLimitExceeded" in str(error)
 
 
 def _message_id(message_ref: object) -> str:
