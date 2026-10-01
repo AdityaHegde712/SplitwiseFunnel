@@ -9,3 +9,9 @@ data/
 # Python execution cache
 __pycache__/
 *.pyc
+
+# Current sprint docs
+.agent-tasks/PLAN.md
+.agent-tasks/TASKS.md
+.agent-tasks/DECISIONS.md
+!.agent-tasks/v*/*.md

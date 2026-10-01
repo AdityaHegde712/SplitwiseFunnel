@@ -1,7 +1,14 @@
 import base64
 import unittest
+from unittest.mock import MagicMock, call, patch
 
-from src.gmail.client import fetch_receipt_emails
+from googleapiclient.errors import HttpError
+
+from src.gmail.client import (
+    GmailRateLimitError,
+    _execute_gmail_request,
+    fetch_receipt_emails,
+)
 
 
 SIGNATURES = {
@@ -125,3 +132,87 @@ class GmailClientContractTests(unittest.TestCase):
                 ends_on="2026-09-30",
                 signatures=SIGNATURES,
             )
+
+    def test_uses_one_narrow_query_per_selected_vendor(self) -> None:
+        service = _FakeService(
+            {
+                "message-1": _message(
+                    "orders@instacart.com",
+                    "Your Instacart order receipt",
+                    "<p>Walmart receipt</p>",
+                ),
+                "message-2": _message(
+                    "no-reply@costco.com",
+                    "Your Costco order receipt",
+                    "<p>Costco receipt</p>",
+                ),
+            }
+        )
+
+        messages = fetch_receipt_emails(
+            service=service,
+            vendor_ids=["walmart_online", "costco_same_day"],
+            starts_on="2026-09-01",
+            ends_on="2026-09-30",
+            signatures=SIGNATURES,
+        )
+
+        queries = service.users().messages().list_queries
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(len(queries), 2)
+        self.assertIn("from:orders@instacart.com", queries[0])
+        self.assertNotIn("no-reply@costco.com", queries[0])
+        self.assertIn("from:no-reply@costco.com", queries[1])
+        self.assertNotIn("orders@instacart.com", queries[1])
+
+    @patch("time.sleep")
+    def test_retries_on_rate_limit_and_succeeds(self, mock_sleep: MagicMock) -> None:
+        mock_request = MagicMock()
+        rate_limit_error = HttpError(resp=MagicMock(status=429), content=b"Rate limit")
+        mock_request.execute.side_effect = [rate_limit_error, {"messages": []}]
+
+        response = _execute_gmail_request(mock_request)
+
+        self.assertEqual(response, {"messages": []})
+        self.assertEqual(mock_request.execute.call_count, 2)
+        mock_sleep.assert_called_once_with(2.0)
+
+    @patch("time.sleep")
+    def test_retries_on_rate_limit_up_to_max_and_raises_rate_limit_error(
+        self, mock_sleep: MagicMock
+    ) -> None:
+        mock_request = MagicMock()
+        rate_limit_error = HttpError(resp=MagicMock(status=429), content=b"Rate limit")
+        mock_request.execute.side_effect = [
+            rate_limit_error,
+            rate_limit_error,
+            rate_limit_error,
+        ]
+
+        with self.assertRaises(GmailRateLimitError):
+            _execute_gmail_request(mock_request)
+
+        self.assertEqual(mock_request.execute.call_count, 3)
+        self.assertEqual(mock_sleep.call_args_list, [call(2.0), call(5.0)])
+
+    @patch("time.sleep")
+    def test_paces_message_fetches_with_sleep(self, mock_sleep: MagicMock) -> None:
+        service = _FakeService(
+            {
+                "message-1": _message(
+                    "orders@instacart.com",
+                    "Your Instacart order receipt",
+                    "<p>Walmart receipt</p>",
+                ),
+            }
+        )
+
+        fetch_receipt_emails(
+            service=service,
+            vendor_ids=["walmart_online"],
+            starts_on="2026-09-01",
+            ends_on="2026-09-30",
+            signatures=SIGNATURES,
+        )
+
+        mock_sleep.assert_any_call(0.05)

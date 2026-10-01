@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Splitwise Funnel</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260927-run-aggregate">
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div><p class="eyebrow">Local-only household splitting</p><h1>Splitwise Funnel</h1><p class="muted">Review receipt splits before entering them in Splitwise.</p></div>
+      <p class="status">Local workspace · no Splitwise writes</p>
+    </header>
+    <nav class="tabs" role="tablist" aria-label="Splitwise Funnel sections">
+      <button class="tab" role="tab" aria-selected="true" aria-controls="run" id="run-tab">Run receipts</button>
+      <button class="tab" role="tab" aria-selected="false" aria-controls="past" id="past-tab">Past transactions</button>
+      <button class="tab" role="tab" aria-selected="false" aria-controls="setup" id="setup-tab">Household setup</button>
+    </nav>
+    <p class="feedback" id="feedback" role="status" aria-live="polite" hidden></p>
+    <section id="run" role="tabpanel" aria-labelledby="run-tab" class="active">
+      <div class="grid"><div>
+        <article class="card"><div class="section-head"><div><h2>Run a receipt range</h2><p class="muted">Fetch only the selected receipt emails, then create local copy-ready summaries.</p></div></div>
+          <form id="run-form"><div class="fields"><div><label for="start-on">From</label><input id="start-on" type="date" required></div><div><label for="end-on">Through</label><input id="end-on" type="date" required></div></div>
+            <fieldset class="vendor-fieldset"><legend>Receipt sources</legend><div class="vendors"><label class="choice"><input name="vendor" type="checkbox" value="walmart_online" checked>Instacart · Walmart</label><label class="choice"><input name="vendor" type="checkbox" value="costco_same_day" checked>Costco Same-Day</label></div></fieldset>
+            <div class="actions"><button class="primary" type="submit">Fetch and review receipts</button><button type="button" class="secondary" id="clear-cache">Clear cached receipts</button><span class="hint">Nothing is posted to Splitwise.</span></div></form>
+        </article>
+        <article class="card" id="review-state" hidden><div class="section-head"><div><h2>Copy-ready summaries</h2><p class="muted" id="review-description"></p></div><span class="badge">Local results saved</span></div><div id="summaries"></div></article>
+        <article class="card warning-card" id="mapping-resolution" hidden><h2>Unknown payment method</h2><p class="muted" id="mapping-description"></p><section class="resolution-details" aria-labelledby="resolution-details-title"><h3 id="resolution-details-title">Receipt details</h3><dl id="resolution-details-list"></dl></section><form id="mapping-resolution-form" class="inline-form"><div><label for="unknown-payer">Payer</label><select id="unknown-payer" class="payer-select" required></select></div><button class="primary" type="submit">Save and rerun</button><button class="secondary" type="button" id="mapping-manual-btn">Mark for manual entry</button></form></article>
+        <article class="card warning-card" id="review-resolution" hidden><h2>Receipt review required</h2><p class="muted" id="review-resolution-description"></p><section class="resolution-details" aria-labelledby="review-details-title"><h3 id="review-details-title">Receipt details</h3><dl id="review-details-list"></dl></section><div class="actions"><button class="secondary" type="button" id="review-manual-btn">Mark for manual entry</button></div></article>
+        <article class="card warning-card" id="refund-resolution" hidden><h2>Link refund to purchase receipt</h2><p class="muted" id="refund-description">A refund requires linking to its original purchase receipt before splitting.</p><section class="resolution-details" aria-labelledby="refund-details-title"><h3 id="refund-details-title">Refund details</h3><dl id="refund-details-list"></dl></section><form id="refund-resolution-form" class="inline-form"><div><label for="refund-candidate">Candidate original receipt</label><select id="refund-candidate" required></select></div><button class="primary" type="submit">Link refund and rerun</button></form></article>
+      </div><aside>
+        <article class="card"><h2 class="card-title">What this run does</h2><ol class="steps"><li><span class="dot">1</span><span>Checks only selected vendors and dates.</span></li><li><span class="dot">2</span><span>Matches a card or asks you to assign an unfamiliar method.</span></li><li><span class="dot">3</span><span>Applies exact household rules and equal residual splitting.</span></li><li><span class="dot">4</span><span>Saves a reconciled, copy-ready local summary.</span></li></ol></article>
+        <article class="card"><div class="notice"><strong>Stop rule:</strong> unfamiliar layouts or unreconciled totals remain errors. The app never guesses.</div></article>
+      </aside></div>
+    </section>
+    <section id="past" role="tabpanel" aria-labelledby="past-tab"><article class="card"><div class="section-head"><div><h2>Past transactions</h2><p class="muted">Saved local receipt results. These are not synced to Splitwise.</p></div><button class="secondary" type="button" id="refresh-history">Refresh</button></div><div id="past-runs" class="empty-state">No saved receipt results yet.</div></article></section>
+    <section id="setup" role="tabpanel" aria-labelledby="setup-tab"><div class="setup-grid"><article class="card"><div class="section-head"><div><h2>Payment mappings</h2><p class="muted">One household-wide card last-four maps to one payer.</p></div><button class="secondary" type="button" id="open-json">Edit raw JSON</button></div><div class="mapping-list" id="mapping-list"></div><form id="mapping-form" class="inline-form spaced-form"><div><label for="last-four">Card last four</label><input id="last-four" inputmode="numeric" maxlength="4" pattern="\d{4}" placeholder="1234" required></div><div><label for="payer">Payer</label><select id="payer" class="payer-select" required></select></div><button class="secondary" type="submit">Add mapping</button></form></article><div><article class="card"><h2>Add participant</h2><p class="muted">Adds a person without changing prior results.</p><form id="participant-form" class="inline-form spaced-form"><div><label for="participant-name">Full name</label><input id="participant-name" placeholder="First Last" required></div><button class="secondary" type="submit">Add participant</button></form></article><article class="card"><h2>When to use raw JSON</h2><p class="muted">The forms cover common changes. Raw editing is for batches, absence ranges, and exact rules; every save is validated before it replaces the local file.</p></article></div></div></section>
+  </main>
+  <dialog id="json-dialog"><form method="dialog" id="json-form"><div class="section-head"><div><h2>Raw household JSON</h2><p class="muted">This is your ignored local configuration file, edited with validation.</p></div></div><label for="raw-json">Configuration</label><textarea id="raw-json" spellcheck="false" required></textarea><div class="dialog-actions"><button class="secondary" value="cancel">Cancel</button><button class="primary" value="default" type="submit">Save validated JSON</button></div></form></dialog>
+<script src="/static/app.js?v=20260927-payer-aggregates"></script>
+</body>
+</html>

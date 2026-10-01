@@ -6,8 +6,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html.parser import HTMLParser
+import logging
 import re
-from typing import Final
+from typing import Any, Final
+
+from src.observability.logging import log_event
+
+
+
+LOGGER = logging.getLogger("splitwise_funnel.parsers.receipts")
 
 
 class ReceiptParseError(ValueError):
@@ -71,28 +78,137 @@ class _ReceiptHtmlParser(HTMLParser):
             self._stack[-1].content.append(data)
 
 
-def parse_receipt_email(vendor_id: str, html: str) -> dict[str, object]:
+def parse_receipt_email(
+    vendor_id: str,
+    html: str,
+    fallback_receipt_id: str | None = None,
+) -> dict[str, object]:
     """Parse one supported finalized receipt email into exact-cent receipt data."""
     if vendor_id not in _SUPPORTED_VENDORS:
+        log_event(LOGGER, "receipt_parse_failed", vendor_id=vendor_id, status="unsupported_vendor")
         raise ReceiptParseError(f"Unsupported receipt vendor: {vendor_id!r}.")
     if not isinstance(html, str) or not html.strip():
+        log_event(LOGGER, "receipt_parse_failed", vendor_id=vendor_id, status="missing_body")
         raise ReceiptParseError("Receipt email must contain a supported HTML body.")
 
+    log_event(LOGGER, "receipt_parse_started", vendor_id=vendor_id)
     parser: _ReceiptHtmlParser = _ReceiptHtmlParser()
     try:
         parser.feed(html)
         parser.close()
     except ValueError as error:
+        log_event(LOGGER, "receipt_parse_failed", vendor_id=vendor_id, status="invalid_html")
         raise ReceiptParseError("Receipt email HTML could not be parsed.") from error
 
     if vendor_id == "walmart_online":
-        return _parse_walmart_receipt(parser.root)
-    return _parse_costco_receipt(parser.root)
+        receipt: dict[str, object] = _parse_walmart_receipt(parser.root, fallback_receipt_id)
+    else:
+        receipt = _parse_costco_receipt(parser.root)
+    items: object = receipt.get("items", [])
+    log_event(
+        LOGGER,
+        "receipt_parse_completed",
+        vendor_id=vendor_id,
+        item_count=len(items) if isinstance(items, list) else 0,
+        total_cents=receipt.get("final_total_cents"),
+    )
+    return receipt
 
 
-def _parse_walmart_receipt(root: _Node) -> dict[str, object]:
+def parse_instacart_refund_email(
+    html: str,
+    fallback_refund_id: str | None = None,
+) -> dict[str, Any]:
+    """Parse one Instacart Walmart refund email into safe, value-checked refund data."""
+    if not isinstance(html, str) or not html.strip():
+        log_event(LOGGER, "refund_parse_failed", status="missing_body")
+        raise ReceiptParseError("Refund email must contain a supported HTML body.")
+
+    log_event(LOGGER, "refund_parse_started", vendor_id="walmart_online")
+    parser: _ReceiptHtmlParser = _ReceiptHtmlParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except ValueError as error:
+        log_event(LOGGER, "refund_parse_failed", status="invalid_html")
+        raise ReceiptParseError("Refund email HTML could not be parsed.") from error
+
+    full_text: str = parser.root.text()
+    has_refund_text = bool(re.search(r"\brefund(?:ed)?\b", full_text, flags=re.IGNORECASE))
+    has_refund_class = any(
+        "item-refunded" in node.attributes.get("class", "").split()
+        for node in _walk_nodes(parser.root)
+    )
+    if not (has_refund_text or has_refund_class):
+        log_event(LOGGER, "refund_parse_failed", status="missing_refund_evidence")
+        raise ReceiptParseError("Receipt email does not contain refund evidence.")
+
+    refund_id: str = _extract_order_id(full_text, fallback_refund_id)
+    refund_date: str
+    try:
+        refund_date = _extract_date(
+            full_text,
+            r"was placed on ([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?,\s+\d{4})",
+            "%B %d, %Y",
+        )
+    except ReceiptParseError:
+        try:
+            refund_date = _extract_date(
+                full_text,
+                r"delivered your order on ([A-Za-z]{3}\s+\d{1,2},\s+\d{4})",
+                "%b %d, %Y",
+            )
+        except ReceiptParseError:
+            iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", full_text)
+            if iso_match:
+                refund_date = iso_match.group(1)
+            else:
+                log_event(LOGGER, "refund_parse_failed", status="missing_date")
+                raise ReceiptParseError("Refund email is missing a valid date.")
+
+    amount_cents: int | None = None
+    match = re.search(
+        r"(?:Total\s+refunded|Refund\s+total|Refund\s+amount|Refunded|Refund)\s*:?\s*-?(\$[\d,]+(?:\.\d{2})?)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if match is not None:
+        amount_cents = _money_to_cents(match.group(1))
+    else:
+        refunded_cents = 0
+        for node in _walk_nodes(parser.root):
+            classes = set(node.attributes.get("class", "").split())
+            if "item-refunded" in classes:
+                price_text = _find_descendant_text(node, "item-price")
+                if price_text:
+                    refunded_cents += _extract_money(price_text)
+        if refunded_cents > 0:
+            amount_cents = refunded_cents
+
+    if amount_cents is None or amount_cents <= 0:
+        log_event(LOGGER, "refund_parse_failed", status="missing_amount")
+        raise ReceiptParseError("Refund email is missing an explicit positive refund amount.")
+
+    result: dict[str, Any] = {
+        "refund_id": refund_id,
+        "retailer": "walmart_online",
+        "refund_date": refund_date,
+        "refund_amount_cents": amount_cents,
+    }
+    log_event(
+        LOGGER,
+        "refund_parse_completed",
+        refund_id=refund_id,
+        refund_amount_cents=amount_cents,
+        refund_date=refund_date,
+    )
+    return result
+
+
+
+def _parse_walmart_receipt(root: _Node, fallback_receipt_id: str | None) -> dict[str, object]:
     full_text: str = root.text()
-    receipt_id: str = _extract_order_id(full_text)
+    receipt_id: str = _extract_order_id(full_text, fallback_receipt_id)
     purchase_date: str = _extract_date(
         full_text,
         r"was placed on ([A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?,\s+\d{4})",
@@ -102,6 +218,8 @@ def _parse_walmart_receipt(root: _Node) -> dict[str, object]:
     for node in _walk_nodes(root):
         css_classes: set[str] = set(node.attributes.get("class", "").split())
         if "item-row" not in css_classes:
+            continue
+        if "item-delivered" not in css_classes or "item-refunded" in css_classes:
             continue
         item_name: str | None = _find_descendant_text(node, "item-name")
         item_amount: str | None = _find_descendant_text(node, "item-price")
@@ -118,10 +236,11 @@ def _parse_walmart_receipt(root: _Node) -> dict[str, object]:
             }
         )
 
-    total_cents: int = _extract_money_after_label(full_text, "Total charged")
+    total_cents: int = _extract_walmart_total(full_text)
     return _build_receipt(
         "walmart_online", receipt_id, purchase_date, total_cents, items, full_text
     )
+
 
 
 def _parse_costco_receipt(root: _Node) -> dict[str, object]:
@@ -195,25 +314,42 @@ def _find_descendant_text(node: _Node, css_class: str) -> str | None:
     return None
 
 
-def _extract_order_id(text: str) -> str:
+def _extract_order_id(text: str, fallback_receipt_id: str | None = None) -> str:
     match: re.Match[str] | None = re.search(r"Order ID:\s*#\s*([^\s]+)", text)
-    if match is None:
-        raise ReceiptParseError("Receipt is missing an order ID.")
-    return match.group(1)
+    if match is not None:
+        return match.group(1)
+    if isinstance(fallback_receipt_id, str) and fallback_receipt_id.strip():
+        return fallback_receipt_id
+    raise ReceiptParseError("Receipt is missing an order ID.")
 
 
 def _extract_payment_evidence(text: str) -> tuple[str | None, str | None]:
-    visa_match: re.Match[str] | None = re.search(
-        r"\bvisa\s+(?:ending\s+in\s+)?(\d{4})\b", text, flags=re.IGNORECASE
-    )
-    if visa_match is not None:
-        return "visa", visa_match.group(1)
+    card_patterns: list[tuple[str, str]] = [
+        ("visa", r"\bvisa\s+(?:ending\s+in\s+|••••\s*|\*{4}\s*)?(\d{4})\b"),
+        ("discover", r"\bdiscover\s+(?:ending\s+in\s+|••••\s*|\*{4}\s*)?(\d{4})\b"),
+        ("mastercard", r"\b(?:mastercard|master\s+card)\s+(?:ending\s+in\s+|••••\s*|\*{4}\s*)?(\d{4})\b"),
+        ("amex", r"\b(?:amex|american\s+express)\s+(?:ending\s+in\s+|••••\s*|\*{4}\s*)?(\d{4})\b"),
+    ]
+    for brand, pattern in card_patterns:
+        match: re.Match[str] | None = re.search(pattern, text, flags=re.IGNORECASE)
+        if match is not None:
+            return brand, match.group(1)
 
     paypal_match: re.Match[str] | None = re.search(
         r"\bpaypal(?:\s+card)?\b", text, flags=re.IGNORECASE
     )
     if paypal_match is not None:
         return "paypal", None
+
+    fallback_brands: list[tuple[str, str]] = [
+        ("visa", r"\bvisa(?:\s+card)?\b"),
+        ("discover", r"\bdiscover(?:\s+card)?\b"),
+        ("mastercard", r"\b(?:mastercard|master\s+card)\b"),
+        ("amex", r"\b(?:amex|american\s+express)(?:\s+card)?\b"),
+    ]
+    for brand, pattern in fallback_brands:
+        if re.search(pattern, text, flags=re.IGNORECASE) is not None:
+            return brand, None
 
     return None, None
 
@@ -227,6 +363,47 @@ def _extract_date(text: str, pattern: str, date_format: str) -> str:
         return datetime.strptime(date_text, date_format).date().isoformat()
     except ValueError as error:
         raise ReceiptParseError("Receipt contains an invalid purchase date.") from error
+
+
+def _extract_walmart_total(full_text: str) -> int:
+    order_total_match: re.Match[str] | None = re.search(
+        r"(?:Order\s+Totals?\b.*?\bTotal|Order\s+Total)\s*:?\s*(\$[\d,]+(?:\.\d{2})?)",
+        full_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    overall_total_cents: int | None = (
+        _money_to_cents(order_total_match.group(1))
+        if order_total_match is not None
+        else None
+    )
+
+    charged_matches: list[str] = re.findall(
+        r"Total charged\s*:?\s*(\$[\d,]+(?:\.\d{2})?)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    charged_cents: list[int] = [_money_to_cents(m) for m in charged_matches]
+
+    if overall_total_cents is not None:
+        if len(charged_cents) > 1 and sum(charged_cents) != overall_total_cents:
+            raise ReceiptParseError(
+                f"Split tender charges sum (${sum(charged_cents)/100:.2f}) does not match order total (${overall_total_cents/100:.2f})."
+            )
+        return overall_total_cents
+
+    if charged_cents:
+        return sum(charged_cents) if len(charged_cents) > 1 else charged_cents[0]
+
+    fallback_total_match: re.Match[str] | None = re.search(
+        r"\b(?:Total|Order Total)\s*:?\s*(\$[\d,]+(?:\.\d{2})?)",
+        full_text,
+        flags=re.IGNORECASE,
+    )
+    if fallback_total_match is not None:
+        return _money_to_cents(fallback_total_match.group(1))
+
+    raise ReceiptParseError("Receipt is missing a final total.")
+
 
 
 def _extract_money_after_label(text: str, label: str) -> int:

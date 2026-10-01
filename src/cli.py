@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import sys
@@ -25,6 +26,10 @@ from src.app.workflow import (
 )
 from src.gmail.auth import GmailAuthError, OAuthPaths, build_gmail_service
 from src.gmail.client import ReceiptEmail, fetch_receipt_emails
+from src.observability.logging import configure_logging, log_event
+
+
+LOGGER = logging.getLogger("splitwise_funnel.cli")
 
 
 DEFAULT_VENDOR_IDS: Final[tuple[str, str]] = (
@@ -32,10 +37,13 @@ DEFAULT_VENDOR_IDS: Final[tuple[str, str]] = (
     "costco_same_day",
 )
 
-RECEIPT_SIGNATURES: Final[dict[str, dict[str, str]]] = {
+RECEIPT_SIGNATURES: Final[dict[str, dict[str, str | tuple[str, ...]]]] = {
     "walmart_online": {
         "sender": "orders@instacart.com",
-        "subject": "Your Instacart order receipt",
+        "subject": (
+            "Your Instacart order receipt",
+            "Instacart Order Receipt",
+        ),
     },
     "costco_same_day": {
         "sender": "no-reply@costco.com",
@@ -127,12 +135,15 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--manual-payer")
     parser.add_argument("--oauth-dir", type=Path, default=_default_oauth_directory())
+    parser.add_argument("--log-dir", type=Path, default=_default_log_directory())
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Fetch, process, and write receipt results without retaining email bodies."""
     arguments = parse_arguments(argv)
+    configure_logging(arguments.log_dir)
+    log_event(LOGGER, "cli_run_started", vendor_count=len(arguments.vendors))
     try:
         service = build_gmail_service(OAuthPaths.from_directory(arguments.oauth_dir))
         emails = fetch_receipt_emails(
@@ -143,6 +154,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             signatures=RECEIPT_SIGNATURES,
         )
         if not emails:
+            log_event(LOGGER, "cli_run_failed", status="no_matching_receipts")
             raise WorkflowError("No matching receipt emails were found.")
 
         results = process_emails_with_unknown_payment_resolution(
@@ -153,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         output_paths = _write_results(results, arguments.output)
     except (ConfigError, GmailAuthError, ResultError, ValueError, WorkflowError, OSError):
+        log_event(LOGGER, "cli_run_failed", status="processing_error")
         print(
             "Error: receipt processing could not complete. Verify local setup, dates, "
             "mappings, and receipt formats.",
@@ -160,6 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    log_event(LOGGER, "cli_run_completed", status="completed", receipt_count=len(output_paths))
     print(f"Wrote {len(output_paths)} receipt result(s).")
     for json_path, markdown_path in output_paths:
         print(json_path)
@@ -172,6 +186,13 @@ def _default_oauth_directory() -> Path:
     if local_app_data:
         return Path(local_app_data) / "SplitwiseFunnel" / "oauth"
     return Path.home() / "AppData" / "Local" / "SplitwiseFunnel" / "oauth"
+
+
+def _default_log_directory() -> Path:
+    local_app_data: str | None = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "SplitwiseFunnel" / "logs"
+    return Path.home() / "AppData" / "Local" / "SplitwiseFunnel" / "logs"
 
 
 def _write_results(

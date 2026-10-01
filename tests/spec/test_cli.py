@@ -25,12 +25,14 @@ class CommandLineContractTests(unittest.TestCase):
             "--end-on", "2026-09-17",
             "--vendors", "costco_same_day",
             "--manual-payer", "nitish",
+            "--log-dir", "C:/private/logs",
         ])
 
         self.assertEqual(arguments.config, Path("C:/private/household.json"))
         self.assertEqual(arguments.output, Path("C:/private/results"))
         self.assertEqual(arguments.vendors, ["costco_same_day"])
         self.assertEqual(arguments.manual_payer, "nitish")
+        self.assertEqual(arguments.log_dir, Path("C:/private/logs"))
 
     def test_defaults_to_both_supported_vendors(self) -> None:
         arguments = parse_arguments([
