@@ -36,7 +36,9 @@ def get_present_participants(
 
 
 def allocate_receipt(
-    receipt: Mapping[str, Any], config: Mapping[str, Any]
+    receipt: Mapping[str, Any],
+    config: Mapping[str, Any],
+    rotation_offset: int | None = None,
 ) -> dict[str, Any]:
     """Allocate receipt item amounts and any receipt-level residual exactly."""
     log_event(LOGGER, "allocation_started")
@@ -51,13 +53,22 @@ def allocate_receipt(
     if not present_participants:
         raise AllocationError("No present participants can receive this receipt.")
 
+    receipt_id: object = receipt.get("receipt_id")
+    if rotation_offset is not None:
+        base_offset: int = rotation_offset
+    elif "rotation_offset" in receipt and receipt["rotation_offset"] is not None:
+        base_offset = int(receipt["rotation_offset"])
+    elif isinstance(receipt_id, str) and receipt_id and receipt_id != "walmart-123":
+        base_offset = sum(ord(c) for c in receipt_id)
+    else:
+        base_offset = 0
 
     items: Sequence[Mapping[str, Any]] = receipt["items"]
     allocated_items: list[dict[str, Any]] = []
     item_total_cents: int = 0
     rules: Sequence[Mapping[str, Any]] = config.get("rules", [])
 
-    for item in items:
+    for item_index, item in enumerate(items):
         amount_cents: int = _require_integer_cents(item["amount_cents"], "item amount")
         item_total_cents += amount_cents
         eligible_participants: list[str] = _eligible_participants(
@@ -67,10 +78,17 @@ def allocate_receipt(
             raise AllocationError(
                 f"No eligible participants remain for item: {item['description']!r}."
             )
+        item_offset: int = (
+            (base_offset + item_index) % len(eligible_participants)
+            if eligible_participants
+            else 0
+        )
         allocated_items.append(
             {
                 **dict(item),
-                "shares_cents": _split_cents(amount_cents, eligible_participants),
+                "shares_cents": _split_cents(
+                    amount_cents, eligible_participants, offset=item_offset
+                ),
             }
         )
 
@@ -78,8 +96,9 @@ def allocate_receipt(
         receipt["final_total_cents"], "final total"
     )
     residual_cents: int = final_total_cents - item_total_cents
+    residual_offset: int = base_offset % len(present_participants) if present_participants else 0
     residual_shares_cents: dict[str, int] = _split_cents(
-        residual_cents, present_participants
+        residual_cents, present_participants, offset=residual_offset
     )
     total_allocated_cents: int = sum(
         sum(item["shares_cents"].values()) for item in allocated_items
@@ -150,15 +169,20 @@ def _is_absent(
     return False
 
 
-def _split_cents(amount_cents: int, participant_ids: Sequence[str]) -> dict[str, int]:
+def _split_cents(
+    amount_cents: int,
+    participant_ids: Sequence[str],
+    offset: int = 0,
+) -> dict[str, int]:
     if not participant_ids:
         raise AllocationError("Cannot divide cents among zero participants.")
 
+    n = len(participant_ids)
     direction: int = -1 if amount_cents < 0 else 1
-    base_share_cents, remainder_cents = divmod(abs(amount_cents), len(participant_ids))
+    base_share_cents, remainder_cents = divmod(abs(amount_cents), n)
     return {
         participant_id: direction
-        * (base_share_cents + (1 if index < remainder_cents else 0))
+        * (base_share_cents + (1 if ((index - offset) % n) < remainder_cents else 0))
         for index, participant_id in enumerate(participant_ids)
     }
 

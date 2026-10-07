@@ -87,8 +87,9 @@ def _load_or_authorize_credentials(
                 str(paths.token_path), GMAIL_READONLY_SCOPE
             )
         except Exception as error:
+            paths.token_path.unlink(missing_ok=True)
             log_event(LOGGER, "gmail_authorization_failed", status="saved_token_invalid")
-            raise GmailAuthError("The saved Gmail authorization token is invalid.") from error
+            raise GmailAuthError("The saved Gmail authorization token is invalid and was removed from token.json.") from error
 
     if credentials is not None and credentials.valid:
         log_event(LOGGER, "gmail_authorization_completed", status="saved_token_valid")
@@ -98,8 +99,9 @@ def _load_or_authorize_credentials(
         try:
             credentials.refresh(request_type())
         except Exception as error:
+            paths.token_path.unlink(missing_ok=True)
             log_event(LOGGER, "gmail_authorization_failed", status="token_refresh_failed")
-            raise GmailAuthError("The saved Gmail authorization token could not be refreshed.") from error
+            raise GmailAuthError("The saved Gmail authorization token could not be refreshed and was removed from token.json.") from error
     else:
         try:
             flow: Any = flow_type.from_client_secrets_file(

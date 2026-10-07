@@ -260,16 +260,7 @@ def render_markdown_run_summary(aggregate: Mapping[str, Any]) -> str:
         "",
         f"- Receipts: {receipt_count}",
         f"- Household total: {_format_cents(total_cents)}",
-        "",
-        "## Per-person totals",
-        "",
     ]
-    for participant_id, amount_cents in participant_totals.items():
-        _require_nonempty_string(participant_id, "aggregate participant id")
-        lines.append(
-            f"- {_display_id(participant_id)}: "
-            f"{_format_cents(_require_integer_cents(amount_cents, 'aggregate participant total'))}"
-        )
 
     payer_aggregates = aggregate.get("payer_aggregates")
     if isinstance(payer_aggregates, Mapping) and payer_aggregates:

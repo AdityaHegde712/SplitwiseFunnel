@@ -1,6 +1,6 @@
 import unittest
 
-from src.domain.allocate import AllocationError, allocate_receipt
+from src.domain.allocate import AllocationError, allocate_receipt, _split_cents
 
 
 PARTICIPANTS = ["himanshu", "krishna", "nitish"]
@@ -81,3 +81,73 @@ class AllocationContractTests(unittest.TestCase):
                     "rules": [{"match_description": "milk", "exclude": PARTICIPANTS}],
                 },
             )
+
+    def test_split_cents_rotates_remainder_by_offset(self) -> None:
+        self.assertEqual(
+            _split_cents(1000, ["a", "b", "c"], offset=0),
+            {"a": 334, "b": 333, "c": 333},
+        )
+        self.assertEqual(
+            _split_cents(1000, ["a", "b", "c"], offset=1),
+            {"a": 333, "b": 334, "c": 333},
+        )
+        self.assertEqual(
+            _split_cents(1000, ["a", "b", "c"], offset=2),
+            {"a": 333, "b": 333, "c": 334},
+        )
+
+    def test_allocates_receipt_with_receipt_id_rotation(self) -> None:
+        # 'test-receipt-2' sum(ord(c)) is 1336, 1336 % 3 == 1 (krishna)
+        result = allocate_receipt(
+            receipt={
+                "receipt_id": "test-receipt-2",
+                "purchase_date": "2026-09-17",
+                "final_total_cents": 1001,
+                "items": [{"description": "Rice", "amount_cents": 1000}],
+            },
+            config={"participant_ids": PARTICIPANTS, "absences": [], "rules": []},
+        )
+        self.assertEqual(
+            result["items"][0]["shares_cents"],
+            {"himanshu": 333, "krishna": 334, "nitish": 333},
+        )
+        self.assertEqual(
+            result["residual_shares_cents"],
+            {"himanshu": 0, "krishna": 1, "nitish": 0},
+        )
+        self.assertEqual(result["total_allocated_cents"], 1001)
+
+    def test_allocates_multi_item_receipt_with_round_robin_item_offsets(self) -> None:
+        result = allocate_receipt(
+            receipt={
+                "purchase_date": "2026-09-17",
+                "final_total_cents": 3000,
+                "items": [
+                    {"description": "Item 1", "amount_cents": 1000},
+                    {"description": "Item 2", "amount_cents": 1000},
+                    {"description": "Item 3", "amount_cents": 1000},
+                ],
+            },
+            config={"participant_ids": PARTICIPANTS, "absences": [], "rules": []},
+        )
+        self.assertEqual(
+            result["items"][0]["shares_cents"],
+            {"himanshu": 334, "krishna": 333, "nitish": 333},
+        )
+        self.assertEqual(
+            result["items"][1]["shares_cents"],
+            {"himanshu": 333, "krishna": 334, "nitish": 333},
+        )
+        self.assertEqual(
+            result["items"][2]["shares_cents"],
+            {"himanshu": 333, "krishna": 333, "nitish": 334},
+        )
+        participant_totals = {p: 0 for p in PARTICIPANTS}
+        for item in result["items"]:
+            for p, cents in item["shares_cents"].items():
+                participant_totals[p] += cents
+        self.assertEqual(
+            participant_totals,
+            {"himanshu": 1000, "krishna": 1000, "nitish": 1000},
+        )
+        self.assertEqual(result["total_allocated_cents"], 3000)
