@@ -24,6 +24,7 @@ class LocalWebApiContractTests(unittest.TestCase):
         temporary_path = Path(self.temporary_directory.name)
         self.config_path = temporary_path / "household.json"
         self.log_directory = temporary_path / "logs"
+        self.oauth_directory = temporary_path / "oauth"
         self.config_path.write_text(
             json.dumps(
                 {
@@ -35,7 +36,13 @@ class LocalWebApiContractTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        self.client = TestClient(create_app(self.config_path, self.log_directory))
+        self.client = TestClient(
+            create_app(
+                self.config_path,
+                self.log_directory,
+                oauth_directory=self.oauth_directory,
+            )
+        )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -572,6 +579,85 @@ class LocalWebApiContractTests(unittest.TestCase):
         self.assertIn("payer_aggregates", data)
         self.assertIn("aditya_hegde", data["payer_aggregates"])
         self.assertEqual(data["payer_aggregates"]["aditya_hegde"]["total_cents"], 1000)
+
+    def test_adds_absence_via_api(self) -> None:
+        response = self.client.post(
+            "/api/v1/household/absences",
+            json={
+                "participant_id": "aditya_hegde",
+                "starts_on": "2026-10-01",
+                "ends_on": "2026-10-10",
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertIn("absences", data)
+        self.assertIn(
+            {
+                "participant_id": "aditya_hegde",
+                "starts_on": "2026-10-01",
+                "ends_on": "2026-10-10",
+            },
+            data["absences"],
+        )
+
+    def test_adds_receipt_payer_mapping_via_api(self) -> None:
+        response = self.client.post(
+            "/api/v1/household/receipt-payer-mappings",
+            json={
+                "receipt_id": "paypal-12345",
+                "payer_id": "aditya_hegde",
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        data = response.json()
+        self.assertEqual(
+            data.get("receipt_payer_mappings", {}).get("paypal-12345"),
+            "aditya_hegde",
+        )
+
+    def test_serves_absence_ui_components(self) -> None:
+        page_response = self.client.get("/")
+        script_response = self.client.get("/static/app.js")
+
+        self.assertEqual(page_response.status_code, 200)
+        self.assertIn('id="absence-list"', page_response.text)
+        self.assertIn('id="absence-form"', page_response.text)
+        self.assertIn('id="absence-participant"', page_response.text)
+        self.assertIn('id="absence-start-on"', page_response.text)
+        self.assertIn('id="absence-end-on"', page_response.text)
+
+        self.assertEqual(script_response.status_code, 200)
+        self.assertIn("/api/v1/household/absences", script_response.text)
+        self.assertIn("/api/v1/household/receipt-payer-mappings", script_response.text)
+        self.assertIn("#absence-list", script_response.text)
+        self.assertIn("#absence-form", script_response.text)
+
+    def test_oauth_reset_removes_token_and_returns_ok(self) -> None:
+        self.oauth_directory.mkdir(parents=True, exist_ok=True)
+        token_path = self.oauth_directory / "token.json"
+        token_path.write_text("{}", encoding="utf-8")
+
+        response = self.client.post("/api/v1/oauth/reset")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertTrue(data["cleared"])
+        self.assertIn("correlation_id", data)
+        self.assertFalse(token_path.exists())
+
+    def test_serves_reset_oauth_ui_components(self) -> None:
+        page_response = self.client.get("/")
+        script_response = self.client.get("/static/app.js")
+
+        self.assertEqual(page_response.status_code, 200)
+        self.assertIn('id="reset-oauth-btn"', page_response.text)
+
+        self.assertEqual(script_response.status_code, 200)
+        self.assertIn("/api/v1/oauth/reset", script_response.text)
+        self.assertIn("#reset-oauth-btn", script_response.text)
+
 
 
 

@@ -483,7 +483,11 @@ def process_cached_receipts(
                 payment_last_four if isinstance(payment_last_four, str) else None
             )
             payer_id, payer_resolution = _resolve_email_payer(
-                vendor_id, last_four, manual_payer_id, config
+                vendor_id,
+                last_four,
+                manual_payer_id,
+                config,
+                receipt_id=receipt.get("receipt_id"),
             )
             allocation: dict[str, Any] = allocate_receipt(receipt, config)
             receipt_id = str(receipt.get("receipt_id"))
@@ -626,16 +630,22 @@ def _resolve_email_payer(
     last_four: str | None,
     manual_payer_id: str | None,
     config: Mapping[str, Any],
+    receipt_id: str | None = None,
 ) -> tuple[str, str]:
     try:
-        return resolve_payer(last_four, manual_payer_id, config)
+        return resolve_payer(
+            payment_last_four=last_four,
+            explicit_payer_id=manual_payer_id,
+            config=config,
+            receipt_id=receipt_id,
+        )
     except ConfigError as error:
         is_unmapped_payment: bool = (
             manual_payer_id is None
             and str(error).startswith("No payer mapping exists for the supplied card")
         )
         if is_unmapped_payment:
-            raise UnknownPaymentMappingError(retailer, last_four) from error
+            raise UnknownPaymentMappingError(retailer, last_four, receipt_id=receipt_id) from error
         raise
 
 

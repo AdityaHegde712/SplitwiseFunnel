@@ -5,9 +5,11 @@ import unittest
 
 from src.app.config import (
     ConfigError,
+    append_absence,
     append_participant,
     append_participant_and_payment_mapping,
     append_payment_mapping,
+    append_receipt_payer_mapping,
     load_config,
     resolve_payer,
 )
@@ -155,10 +157,12 @@ class ConfigAndResultContractTests(unittest.TestCase):
         results = [
             {
                 "receipt": {"receipt_id": "one", "final_total_cents": 1001},
+                "payer": {"participant_id": "krishna", "resolution": "card_last_four"},
                 "participant_totals_cents": {"himanshu": 335, "krishna": 333, "nitish": 333},
             },
             {
                 "receipt": {"receipt_id": "two", "final_total_cents": 500},
+                "payer": {"participant_id": "krishna", "resolution": "card_last_four"},
                 "participant_totals_cents": {"himanshu": 100, "krishna": 200, "nitish": 200},
             },
         ]
@@ -172,7 +176,9 @@ class ConfigAndResultContractTests(unittest.TestCase):
             {"himanshu": 435, "krishna": 533, "nitish": 533},
         )
         summary = render_markdown_run_summary(aggregate)
+        self.assertNotIn("## Per-person totals", summary)
         self.assertIn("# Run total", summary)
+        self.assertIn("## Paid by Krishna", summary)
         self.assertIn("$15.01", summary)
         self.assertIn("Himanshu: $4.35", summary)
 
@@ -389,9 +395,76 @@ class ConfigAndResultContractTests(unittest.TestCase):
         self.assertIn("$20.00", himanshu_agg["markdown_summary"])
 
         summary = render_markdown_run_summary(aggregate)
+        self.assertNotIn("## Per-person totals", summary)
         self.assertIn("# Run total", summary)
         self.assertIn("## Paid by Krishna", summary)
         self.assertIn("## Paid by Himanshu", summary)
         self.assertIn("## Manual Processing Required", summary)
+
+    def test_appends_absence_to_the_config(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "household.json"
+            config_path.write_text(json.dumps(VALID_CONFIG), encoding="utf-8")
+
+            updated_config = append_absence(
+                config_path,
+                participant_id="himanshu",
+                starts_on="2026-10-01",
+                ends_on="2026-10-10",
+            )
+
+            self.assertIn(
+                {
+                    "participant_id": "himanshu",
+                    "starts_on": "2026-10-01",
+                    "ends_on": "2026-10-10",
+                },
+                updated_config["absences"],
+            )
+            self.assertEqual(load_config(config_path), updated_config)
+
+    def test_append_absence_rejects_invalid_participant_or_dates(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "household.json"
+            config_path.write_text(json.dumps(VALID_CONFIG), encoding="utf-8")
+
+            with self.assertRaises(ConfigError):
+                append_absence(config_path, "unknown_person", "2026-10-01", "2026-10-10")
+
+            with self.assertRaises(ConfigError):
+                append_absence(config_path, "himanshu", "invalid-date", "2026-10-10")
+
+            with self.assertRaises(ConfigError):
+                append_absence(config_path, "himanshu", "2026-10-15", "2026-10-10")
+
+    def test_appends_receipt_payer_mapping_to_config(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "household.json"
+            config_path.write_text(json.dumps(VALID_CONFIG), encoding="utf-8")
+
+            updated_config = append_receipt_payer_mapping(
+                config_path,
+                receipt_id="paypal-rec-1",
+                payer_id="krishna",
+            )
+
+            self.assertEqual(
+                updated_config.get("receipt_payer_mappings", {}).get("paypal-rec-1"),
+                "krishna",
+            )
+            self.assertEqual(load_config(config_path), updated_config)
+
+    def test_resolve_payer_prioritizes_receipt_payer_mapping(self) -> None:
+        config = {
+            **VALID_CONFIG,
+            "receipt_payer_mappings": {"rec-custom-1": "himanshu"},
+        }
+        resolved = resolve_payer(
+            payment_last_four="4821",
+            explicit_payer_id="nitish",
+            config=config,
+            receipt_id="rec-custom-1",
+        )
+        self.assertEqual(resolved, ("himanshu", "receipt_mapping"))
 
 

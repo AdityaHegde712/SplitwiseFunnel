@@ -8,6 +8,7 @@ import os
 import tempfile
 from collections.abc import Mapping
 from contextlib import suppress
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -129,6 +130,61 @@ def append_participant_and_payment_mapping(
     return config
 
 
+def append_absence(
+    config_path: Path,
+    participant_id: str,
+    starts_on: str,
+    ends_on: str,
+) -> dict[str, Any]:
+    """Persist a new absence window for an existing participant."""
+    config: dict[str, Any] = load_config(config_path)
+    participant_ids: list[str] = _validated_participant_ids(config)
+    _require_nonempty_string(participant_id, "participant_id")
+    if participant_id not in participant_ids:
+        raise ConfigError(f"Participant {participant_id!r} is not a configured participant.")
+    _require_nonempty_string(starts_on, "starts_on")
+    _require_nonempty_string(ends_on, "ends_on")
+    try:
+        start_date = date.fromisoformat(starts_on)
+        end_date = date.fromisoformat(ends_on)
+    except ValueError as error:
+        raise ConfigError("Absence dates must use ISO YYYY-MM-DD format.") from error
+    if start_date > end_date:
+        raise ConfigError("Absence starts_on must not be after ends_on.")
+
+    config.setdefault("absences", []).append(
+        {"participant_id": participant_id, "starts_on": starts_on, "ends_on": ends_on}
+    )
+    _validate_config(config)
+    _write_config_atomically(config_path, config)
+    log_event(LOGGER, "absence_appended", absence_count=len(config["absences"]))
+    return config
+
+
+def append_receipt_payer_mapping(
+    config_path: Path,
+    receipt_id: str,
+    payer_id: str,
+) -> dict[str, Any]:
+    """Persist a receipt-specific payer mapping for an existing participant."""
+    config: dict[str, Any] = load_config(config_path)
+    participant_ids: list[str] = _validated_participant_ids(config)
+    _require_nonempty_string(receipt_id, "receipt_id")
+    _require_nonempty_string(payer_id, "payer_id")
+    if payer_id not in participant_ids:
+        raise ConfigError(f"Payer {payer_id!r} is not a configured participant.")
+
+    config.setdefault("receipt_payer_mappings", {})[receipt_id] = payer_id
+    _validate_config(config)
+    _write_config_atomically(config_path, config)
+    log_event(
+        LOGGER,
+        "receipt_payer_mapping_appended",
+        receipt_payer_mapping_count=len(config["receipt_payer_mappings"]),
+    )
+    return config
+
+
 def replace_config(config_path: Path, config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and atomically replace the local household configuration."""
     if not isinstance(config, Mapping):
@@ -149,12 +205,22 @@ def resolve_payer(
     payment_last_four: str | None,
     explicit_payer_id: str | None,
     config: Mapping[str, Any],
+    receipt_id: str | None = None,
 ) -> tuple[str, str]:
-    """Resolve a payer from a card mapping, or a validated manual selection."""
+    """Resolve a payer from a receipt mapping, card mapping, or a validated manual selection."""
     participant_ids: list[str] = _validated_participant_ids(config)
     payment_mappings: list[Mapping[str, Any]] = _validated_payment_mappings(
         config, participant_ids
     )
+
+    if receipt_id is not None:
+        receipt_mappings = config.get("receipt_payer_mappings", {})
+        if isinstance(receipt_mappings, Mapping) and receipt_id in receipt_mappings:
+            payer_id = receipt_mappings[receipt_id]
+            if payer_id not in participant_ids:
+                raise ConfigError(f"Mapped payer {payer_id!r} is not a configured participant.")
+            log_event(LOGGER, "payer_resolved", resolution="receipt_mapping")
+            return payer_id, "receipt_mapping"
 
     if payment_last_four is not None:
         _validate_last_four(payment_last_four)
@@ -178,6 +244,8 @@ def resolve_payer(
 def _validate_config(config: Mapping[str, Any]) -> None:
     participant_ids: list[str] = _validated_participant_ids(config)
     _validated_payment_mappings(config, participant_ids)
+    _validated_receipt_payer_mappings(config, participant_ids)
+    _validated_absences(config, participant_ids)
 
 
 def _ensure_mapping_is_new(
@@ -252,6 +320,59 @@ def _validated_payment_mappings(
         seen_last_fours.add(last_four)
         validated_mappings.append(payment_mapping)
     return validated_mappings
+
+
+def _validated_receipt_payer_mappings(
+    config: Mapping[str, Any], participant_ids: list[str]
+) -> dict[str, str]:
+    receipt_payer_mappings: object = config.get("receipt_payer_mappings", {})
+    if not isinstance(receipt_payer_mappings, Mapping):
+        raise ConfigError("receipt_payer_mappings must be a JSON object.")
+
+    validated: dict[str, str] = {}
+    for receipt_id, payer_id in receipt_payer_mappings.items():
+        _require_nonempty_string(receipt_id, "receipt_payer_mappings key")
+        _require_nonempty_string(payer_id, "receipt_payer_mappings value")
+        if payer_id not in participant_ids:
+            raise ConfigError(
+                f"receipt_payer_mappings[{receipt_id!r}] payer {payer_id!r} is not a configured participant."
+            )
+        validated[receipt_id] = payer_id
+    return validated
+
+
+def _validated_absences(
+    config: Mapping[str, Any], participant_ids: list[str]
+) -> list[Mapping[str, Any]]:
+    absences: object = config.get("absences", [])
+    if not isinstance(absences, list):
+        raise ConfigError("absences must be a JSON array.")
+
+    validated: list[Mapping[str, Any]] = []
+    for index, absence in enumerate(absences):
+        if not isinstance(absence, Mapping):
+            raise ConfigError(f"absences[{index}] must be an object.")
+        participant_id: object = absence.get("participant_id")
+        _require_nonempty_string(participant_id, f"absences[{index}].participant_id")
+        if participant_id not in participant_ids:
+            raise ConfigError(
+                f"absences[{index}].participant_id {participant_id!r} is not a configured participant."
+            )
+        starts_on: object = absence.get("starts_on")
+        ends_on: object = absence.get("ends_on")
+        _require_nonempty_string(starts_on, f"absences[{index}].starts_on")
+        _require_nonempty_string(ends_on, f"absences[{index}].ends_on")
+        try:
+            start_date = date.fromisoformat(str(starts_on))
+            end_date = date.fromisoformat(str(ends_on))
+        except ValueError as error:
+            raise ConfigError(
+                f"absences[{index}] dates must use ISO YYYY-MM-DD format."
+            ) from error
+        if start_date > end_date:
+            raise ConfigError(f"absences[{index}] starts_on must not be after ends_on.")
+        validated.append(absence)
+    return validated
 
 
 def _require_nonempty_string(value: object, field_name: str) -> None:

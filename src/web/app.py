@@ -20,8 +20,10 @@ from starlette.responses import Response
 
 from src.app.config import (
     ConfigError,
+    append_absence,
     append_participant,
     append_payment_mapping,
+    append_receipt_payer_mapping,
     load_config,
     replace_config,
 )
@@ -116,11 +118,27 @@ class ManualReceiptRequest(BaseModel):
 
 
 
+class AbsenceRequest(BaseModel):
+    """Validated payload for registering a member absence window."""
+
+    participant_id: str = Field(min_length=1, max_length=128)
+    starts_on: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    ends_on: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+class ReceiptPayerMappingRequest(BaseModel):
+    """Validated payload for associating a receipt with a payer."""
+
+    receipt_id: str = Field(min_length=1, max_length=128)
+    payer_id: str = Field(min_length=1, max_length=128)
+
+
 class HouseholdConfigRequest(BaseModel):
     """Validated raw JSON editor payload, checked by the domain config validator."""
 
     participant_ids: list[str]
     payment_mappings: list[dict[str, Any]] = Field(default_factory=list)
+    receipt_payer_mappings: dict[str, str] = Field(default_factory=dict)
     absences: list[dict[str, Any]] = Field(default_factory=list)
     rules: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -233,6 +251,37 @@ def create_app(
         config = append_payment_mapping(
             config_path,
             payload.last_four,
+            payload.payer_id.strip(),
+        )
+        return {**config, "correlation_id": _correlation_id(request)}
+
+    @app.post(
+        "/api/v1/household/absences",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_absence(
+        request: Request,
+        payload: AbsenceRequest,
+    ) -> dict[str, Any]:
+        config = append_absence(
+            config_path,
+            payload.participant_id.strip(),
+            payload.starts_on.strip(),
+            payload.ends_on.strip(),
+        )
+        return {**config, "correlation_id": _correlation_id(request)}
+
+    @app.post(
+        "/api/v1/household/receipt-payer-mappings",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_receipt_payer_mapping(
+        request: Request,
+        payload: ReceiptPayerMappingRequest,
+    ) -> dict[str, Any]:
+        config = append_receipt_payer_mapping(
+            config_path,
+            payload.receipt_id.strip(),
             payload.payer_id.strip(),
         )
         return {**config, "correlation_id": _correlation_id(request)}
@@ -389,6 +438,7 @@ def create_app(
                 headers={CORRELATION_ID_HEADER: correlation_id},
             )
         except GmailAuthError:
+            (selected_oauth_directory / "token.json").unlink(missing_ok=True)
             log_event(
                 logger,
                 "receipt_run_gmail_authorization_failed",
@@ -397,7 +447,7 @@ def create_app(
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 content={
-                    "detail": "The saved Gmail authorization token could not be refreshed. Rename or remove token.json from the local OAuth folder, then retry and complete the browser sign-in; no receipt emails were fetched.",
+                    "detail": "The saved Gmail authorization token could not be refreshed and was removed from token.json. Retry to sign in via your browser; no receipt emails were fetched.",
                     "reason_code": "gmail_authorization_failed",
                     "correlation_id": correlation_id,
                 },
@@ -533,6 +583,11 @@ def create_app(
         )
         correlation_id = _correlation_id(request)
         return {"cleared_count": cleared_count, "correlation_id": correlation_id}
+
+    @app.post("/api/v1/oauth/reset")
+    async def reset_oauth(request: Request) -> dict[str, Any]:
+        (selected_oauth_directory / "token.json").unlink(missing_ok=True)
+        return {"status": "ok", "cleared": True, "correlation_id": _correlation_id(request)}
 
     return app
 
